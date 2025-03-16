@@ -125,7 +125,8 @@ struct PsyqLnkFile {
     struct Expression;
 
     /* The main parser entry point; will return nullptr on error */
-    static std::unique_ptr<PsyqLnkFile> parse(PCSX::IO<PCSX::File> file, bool verbose, bool sorted);
+    static std::unique_ptr<PsyqLnkFile> parse(PCSX::IO<PCSX::File> file, bool verbose, bool sorted,
+                                              bool convertCommToBss);
     static std::string readPsyqString(PCSX::IO<PCSX::File> file) { return file->readString(file->byte()); }
 
     /* Our list of sections and symbols will be keyed by their id from the LNK file */
@@ -154,8 +155,8 @@ struct PsyqLnkFile {
         bool isBss() { return (name == ".bss") || (name == ".sbss"); }
         bool isText() { return (name == ".text"); }
         bool generateElfSection(PsyqLnkFile* psyq, ELFIO::elfio& writer);
-        bool generateElfRelocations(ElfRelocationPass pass, const std::string& prefix, PsyqLnkFile* psyq,
-                                    ELFIO::elfio& writer, ELFIO::Elf_Word symbolSectionIndex,
+        bool generateElfRelocations(ElfRelocationPass pass, const std::string& prefix, bool convertCommToBss,
+                                    PsyqLnkFile* psyq, ELFIO::elfio& writer, ELFIO::Elf_Word symbolSectionIndex,
                                     ELFIO::string_section_accessor& stra, ELFIO::symbol_section_accessor& syma);
     };
     struct Symbol : public SymbolTree::Node, public SymbolList::Node {
@@ -182,7 +183,7 @@ struct PsyqLnkFile {
         }
         void display(PsyqLnkFile* lnk);
         bool generateElfSymbol(PsyqLnkFile* psyq, ELFIO::string_section_accessor& stra,
-                               ELFIO::symbol_section_accessor& syma);
+                               ELFIO::symbol_section_accessor& syma, bool convertCommToBss);
     };
     struct Relocation {
         PsyqRelocType type;
@@ -190,7 +191,7 @@ struct PsyqLnkFile {
         int32_t addend;
         std::unique_ptr<Expression> expression;
         void display(PsyqLnkFile* lnk, PsyqLnkFile::Section* sec);
-        bool generateElf(ElfRelocationPass pass, const std::string& prefix, PsyqLnkFile* psyq,
+        bool generateElf(ElfRelocationPass pass, const std::string& prefix, bool convertCommToBss, PsyqLnkFile* psyq,
                          PsyqLnkFile::Section* section, ELFIO::elfio& writer, ELFIO::string_section_accessor& stra,
                          ELFIO::symbol_section_accessor& syma, ELFIO::relocation_section_accessor& rela);
     };
@@ -227,7 +228,8 @@ struct PsyqLnkFile {
     std::string elfConversionError;
 
     void display();
-    bool writeElf(const std::string& prefix, const std::string& out, bool abiNone, bool bigEndian);
+    bool writeElf(const std::string& prefix, const std::string& out, bool abiNone, bool bigEndian,
+                  bool convertCommToBss);
     template <typename... Args>
     inline void setElfConversionError(std::string_view formatStr, Args&&... args) {
         elfConversionError = fmt::format(fmt::runtime(formatStr), args...);
@@ -243,7 +245,8 @@ struct PsyqLnkFile {
 };
 
 /* The psyq LNK parser code */
-std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::IO<PCSX::File> file, bool verbose, bool sorted) {
+std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::IO<PCSX::File> file, bool verbose, bool sorted,
+                                                bool convertCommToBss) {
     std::unique_ptr<PsyqLnkFile> ret = std::make_unique<PsyqLnkFile>();
     vprint(":: Reading signature.\n");
     std::string signature = file->readString(3);
@@ -283,22 +286,24 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::IO<PCSX::File> file, bool 
                         ret->symbolsList.push_back(&symbol);
                     }
                 }
-                // Determine bss symbol placement
-                // This has to be done after parsing the whole psyq object, as bss may be out of order in the file.
-                // Doing it here ensures that we process symbols in their id order, instead of by psyq object file
-                // order, if the user requested ordering by id - otherwise, it'll indeed be order of appearance.
-                for (auto& symbol : ret->symbolsList) {
-                    // Static bss symbols will be represented as a ZEROES opcode instead of UNINITIALIZED.
-                    // This will cause them to have a size of zero, so ignore size zero symbols here.
-                    // Their relocs will resolve to an offset of the local .bss instead, so this causes no issues.
-                    if (symbol.size > 0) {
-                        auto section = ret->sections.find(symbol.sectionIndex);
-                        if (section != ret->sections.end() && section->isBss()) {
-                            auto align = std::min((uint32_t)section->alignment, symbol.size) - 1;
-                            section->uninitializedOffset += align;
-                            section->uninitializedOffset &= ~align;
-                            symbol.offset = section->uninitializedOffset;
-                            section->uninitializedOffset += symbol.size;
+                if (convertCommToBss) {
+                    // Determine bss symbol placement
+                    // This has to be done after parsing the whole psyq object, as bss may be out of order in the file.
+                    // Doing it here ensures that we process symbols in their id order, instead of by psyq object file
+                    // order, if the user requested ordering by id - otherwise, it'll indeed be order of appearance.
+                    for (auto& symbol : ret->symbolsList) {
+                        // Static bss symbols will be represented as a ZEROES opcode instead of UNINITIALIZED.
+                        // This will cause them to have a size of zero, so ignore size zero symbols here.
+                        // Their relocs will resolve to an offset of the local .bss instead, so this causes no issues.
+                        if (symbol.size > 0) {
+                            auto section = ret->sections.find(symbol.sectionIndex);
+                            if (section != ret->sections.end() && section->isBss()) {
+                                auto align = std::min((uint32_t)section->alignment, symbol.size) - 1;
+                                section->uninitializedOffset += align;
+                                section->uninitializedOffset &= ~align;
+                                symbol.offset = section->uninitializedOffset;
+                                section->uninitializedOffset += symbol.size;
+                            }
                         }
                     }
                 }
@@ -886,7 +891,8 @@ void PsyqLnkFile::Expression::display(PsyqLnkFile* lnk, bool top) {
 }
 
 /* The ELF writer code */
-bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bool abiNone, bool bigEndian) {
+bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bool abiNone, bool bigEndian,
+                           bool convertCommToBss) {
     ELFIO::elfio writer;
     writer.create(ELFIO::ELFCLASS32, bigEndian ? ELFIO::ELFDATA2MSB : ELFIO::ELFDATA2LSB);
     writer.set_os_abi(abiNone ? ELFIO::ELFOSABI_NONE : ELFIO::ELFOSABI_LINUX);
@@ -920,7 +926,7 @@ bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bo
 
     fmt::print("  :: Generating relocations - pass 1, local only\n");
     for (auto& section : sectionsList) {
-        bool success = section.generateElfRelocations(ElfRelocationPass::PASS1, prefix, this, writer,
+        bool success = section.generateElfRelocations(ElfRelocationPass::PASS1, prefix, convertCommToBss, this, writer,
                                                       sym_sec->get_index(), stra, syma);
         if (!success) return false;
     }
@@ -929,7 +935,7 @@ bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bo
     // Generate local symbols first
     for (auto& symbol : symbolsList) {
         if (symbol.symbolType == Symbol::Type::LOCAL) {
-            bool success = symbol.generateElfSymbol(this, stra, syma);
+            bool success = symbol.generateElfSymbol(this, stra, syma, convertCommToBss);
             if (!success) return false;
         }
     }
@@ -939,14 +945,14 @@ bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bo
     // Generate all other symbols afterwards
     for (auto& symbol : symbolsList) {
         if (symbol.symbolType != Symbol::Type::LOCAL) {
-            bool success = symbol.generateElfSymbol(this, stra, syma);
+            bool success = symbol.generateElfSymbol(this, stra, syma, convertCommToBss);
             if (!success) return false;
         }
     }
 
     fmt::print("  :: Generating relocations - pass 2, globals only\n");
     for (auto& section : sectionsList) {
-        bool success = section.generateElfRelocations(ElfRelocationPass::PASS2, prefix, this, writer,
+        bool success = section.generateElfRelocations(ElfRelocationPass::PASS2, prefix, convertCommToBss, this, writer,
                                                       sym_sec->get_index(), stra, syma);
         if (!success) return false;
     }
@@ -964,13 +970,15 @@ bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bo
 }
 
 bool PsyqLnkFile::Symbol::generateElfSymbol(PsyqLnkFile* psyq, ELFIO::string_section_accessor& stra,
-                                            ELFIO::symbol_section_accessor& syma) {
+                                            ELFIO::symbol_section_accessor& syma, bool convertCommToBss) {
     ELFIO::Elf_Half elfSectionIndex = 0;
     bool isText = false;
     bool isWeak = false;
 
     fmt::print("    :: Generating symbol {} {} {}\n", name, getOffset(psyq), sectionIndex);
-    if (symbolType != Type::IMPORTED) {
+    if (symbolType == Type::UNINITIALIZED && !convertCommToBss) {
+        elfSectionIndex = ELFIO::SHN_COMMON;
+    } else if (symbolType != Type::IMPORTED) {
         auto section = psyq->sections.find(sectionIndex);
         if (section == psyq->sections.end()) {
             psyq->setElfConversionError("Couldn't find section index {} for symbol {} ('{}')", sectionIndex, getKey(),
@@ -1048,8 +1056,9 @@ static const std::map<PsyqRelocType, elf_mips_reloc_type> typeMap = {
     {PsyqRelocType::REL32_BE, elf_mips_reloc_type::R_MIPS_32},
 };
 
-bool PsyqLnkFile::Section::generateElfRelocations(ElfRelocationPass pass, const std::string& prefix, PsyqLnkFile* psyq,
-                                                  ELFIO::elfio& writer, ELFIO::Elf_Word symbolSectionIndex,
+bool PsyqLnkFile::Section::generateElfRelocations(ElfRelocationPass pass, const std::string& prefix,
+                                                  bool convertCommToBss, PsyqLnkFile* psyq, ELFIO::elfio& writer,
+                                                  ELFIO::Elf_Word symbolSectionIndex,
                                                   ELFIO::string_section_accessor& stra,
                                                   ELFIO::symbol_section_accessor& syma) {
     if (relocations.size() == 0) return true;
@@ -1064,7 +1073,7 @@ bool PsyqLnkFile::Section::generateElfRelocations(ElfRelocationPass pass, const 
     ELFIO::relocation_section_accessor rela(writer, rel_sec);
 
     for (auto& relocation : relocations) {
-        bool success = relocation.generateElf(pass, prefix, psyq, this, writer, stra, syma, rela);
+        bool success = relocation.generateElf(pass, prefix, convertCommToBss, psyq, this, writer, stra, syma, rela);
         if (!success) return false;
     }
 
@@ -1208,8 +1217,8 @@ bool PsyqLnkFile::Section::generateElfRelocations(ElfRelocationPass pass, const 
     return true;
 }
 
-bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::string& prefix, PsyqLnkFile* psyq,
-                                          PsyqLnkFile::Section* section, ELFIO::elfio& writer,
+bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::string& prefix, bool convertCommToBss,
+                                          PsyqLnkFile* psyq, PsyqLnkFile::Section* section, ELFIO::elfio& writer,
                                           ELFIO::string_section_accessor& stra, ELFIO::symbol_section_accessor& syma,
                                           ELFIO::relocation_section_accessor& rela) {
     fmt::print("    :: Generating relocation ");
@@ -1387,7 +1396,22 @@ bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::str
                     psyq->setElfConversionError("Couldn't find symbol {} for relocation.", expr->symbolIndex);
                     return false;
                 }
-                if (symbol->symbolType != PsyqLnkFile::Symbol::Type::IMPORTED) {
+
+                bool makeLocalReloc;
+                switch (symbol->symbolType) {
+                    case PsyqLnkFile::Symbol::Type::IMPORTED:
+                        makeLocalReloc = false;
+                        break;
+                    case PsyqLnkFile::Symbol::Type::UNINITIALIZED:
+                        makeLocalReloc = convertCommToBss;
+                        break;
+                    case PsyqLnkFile::Symbol::Type::LOCAL:
+                    case PsyqLnkFile::Symbol::Type::EXPORTED:
+                        makeLocalReloc = true;
+                        break;
+                }
+
+                if (makeLocalReloc) {
                     return localSymbolReloc(symbol->sectionIndex, symbol->getOffset(psyq) + addend);
                 }
                 if (pass == ElfRelocationPass::PASS1) {
@@ -1536,6 +1560,7 @@ Usage: {} input.obj [input2.obj...] [-h] [-v] [-d] [-n] [-p prefix] [-o output.o
   -o output.o    tries to dump the parsed psyq LNK file into an ELF file;
                  can only work with a single input file.
   -b             outputs a big-endian ELF file.
+  -c             converts comm symbols into .bss symbols
 )",
                    argv[0]);
         return -1;
@@ -1551,7 +1576,7 @@ Usage: {} input.obj [input2.obj...] [-h] [-v] [-d] [-n] [-p prefix] [-o output.o
             fmt::print(stderr, "Unable to open file: {}\n", input);
             ret = -2;
         } else {
-            auto psyq = PsyqLnkFile::parse(file, verbose, !!args.get<bool>("s"));
+            auto psyq = PsyqLnkFile::parse(file, verbose, !!args.get<bool>("s"), !!args.get<bool>("c"));
             if (!psyq) {
                 ret = -3;
             } else {
@@ -1563,8 +1588,8 @@ Usage: {} input.obj [input2.obj...] [-h] [-v] [-d] [-n] [-p prefix] [-o output.o
                 if (hasOutput) {
                     fmt::print(":: Converting {} to {}...\n", input, output.value());
                     std::string prefix = args.get<std::string>("p").value_or("");
-                    bool success = psyq->writeElf(prefix, output.value(), !!args.get<bool>("n"),
-                                                  !!args.get<bool>("b"));
+                    bool success = psyq->writeElf(prefix, output.value(), !!args.get<bool>("n"), !!args.get<bool>("b"),
+                                                  !!args.get<bool>("c"));
                     if (success) {
                         fmt::print(":: Conversion completed.\n");
                     } else {
