@@ -287,6 +287,7 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::IO<PCSX::File> file, bool 
                 // This has to be done after parsing the whole psyq object, as bss may be out of order in the file.
                 // Doing it here ensures that we process symbols in their id order, instead of by psyq object file
                 // order, if the user requested ordering by id - otherwise, it'll indeed be order of appearance.
+#if 0
                 for (auto& symbol : ret->symbolsList) {
                     // Static bss symbols will be represented as a ZEROES opcode instead of UNINITIALIZED.
                     // This will cause them to have a size of zero, so ignore size zero symbols here.
@@ -302,6 +303,7 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::IO<PCSX::File> file, bool 
                         }
                     }
                 }
+#endif
                 return ret;
             }
             case (uint8_t)PsyqOpcode::BYTES: {
@@ -970,7 +972,9 @@ bool PsyqLnkFile::Symbol::generateElfSymbol(PsyqLnkFile* psyq, ELFIO::string_sec
     bool isWeak = false;
 
     fmt::print("    :: Generating symbol {} {} {}\n", name, getOffset(psyq), sectionIndex);
-    if (symbolType != Type::IMPORTED) {
+    if (symbolType == Type::UNINITIALIZED) {
+        elfSectionIndex = ELFIO::SHN_COMMON;
+    } else if (symbolType != Type::IMPORTED) {
         auto section = psyq->sections.find(sectionIndex);
         if (section == psyq->sections.end()) {
             psyq->setElfConversionError("Couldn't find section index {} for symbol {} ('{}')", sectionIndex, getKey(),
@@ -1387,7 +1391,7 @@ bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::str
                     psyq->setElfConversionError("Couldn't find symbol {} for relocation.", expr->symbolIndex);
                     return false;
                 }
-                if (symbol->symbolType != PsyqLnkFile::Symbol::Type::IMPORTED) {
+                if (symbol->symbolType != PsyqLnkFile::Symbol::Type::IMPORTED && symbol->symbolType != PsyqLnkFile::Symbol::Type::UNINITIALIZED) {
                     return localSymbolReloc(symbol->sectionIndex, symbol->getOffset(psyq) + addend);
                 }
                 if (pass == ElfRelocationPass::PASS1) {
